@@ -1,0 +1,8 @@
+{
+  "name": "keyvault-proxy",
+  "version": "1.0.0",
+  "description": "Tuya API proxy for KeyVault by Edifio",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" }
+}
