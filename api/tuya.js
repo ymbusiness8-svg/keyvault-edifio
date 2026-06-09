@@ -177,24 +177,60 @@ export default async function handler(req, res) {
       if (!deviceId||!lockAction) return res.status(400).json({ error:'deviceId et lockAction requis' })
 
       if (lockAction === 'unlock') {
-        // R-Lock: unlock_phone_remote is a boolean DP — must send true (not 1)
-        await tuyaCall({
-          method:'POST',
-          path:`/v1.0/devices/${deviceId}/commands`,
-          body:{ commands:[{ code:'unlock_phone_remote', value:true }] }
-        })
+        // Try multiple DP codes — varies by model
+        const unlockDPs = [
+          { code:'unlock_phone_remote', value:true },
+          { code:'remote_lock_motor',   value:false },
+          { code:'lock_motor_state',    value:false },
+          { code:'open_close',          value:true  },
+        ]
+        let unlocked = false
+        let lastErr = null
+        for (const dp of unlockDPs) {
+          try {
+            await tuyaCall({
+              method:'POST',
+              path:`/v1.0/devices/${deviceId}/commands`,
+              body:{ commands:[dp] }
+            })
+            console.log('[KeyVault] Unlock succeeded with DP:', dp.code)
+            unlocked = true
+            break
+          } catch(e) {
+            if (e.message.includes('2008') || e.message.includes('2012') || e.message.includes('not support')) {
+              lastErr = e
+              continue
+            }
+            throw e
+          }
+        }
+        if (!unlocked) throw lastErr
       } else {
-        // Lock: use lock_motor_state = true (locked)
-        // Note: most keyboxes auto-lock, manual lock may not be supported
-        try {
-          await tuyaCall({
-            method:'POST',
-            path:`/v1.0/devices/${deviceId}/commands`,
-            body:{ commands:[{ code:'lock_motor_state', value:true }] }
-          })
-        } catch(e) {
-          // If manual lock not supported, that's OK - keybox auto-locks
-          console.log('[KeyVault] Manual lock not supported (auto-lock active):', e.message)
+        // Lock: try multiple DPs
+        const lockDPs = [
+          { code:'lock_motor_state',  value:true  },
+          { code:'remote_lock_motor', value:true  },
+          { code:'open_close',        value:false },
+        ]
+        let locked = false
+        for (const dp of lockDPs) {
+          try {
+            await tuyaCall({
+              method:'POST',
+              path:`/v1.0/devices/${deviceId}/commands`,
+              body:{ commands:[dp] }
+            })
+            console.log('[KeyVault] Lock succeeded with DP:', dp.code)
+            locked = true
+            break
+          } catch(e) {
+            if (e.message.includes('2008') || e.message.includes('2012') || e.message.includes('not support')) continue
+            throw e
+          }
+        }
+        if (!locked) {
+          // Keybox auto-locks — not an error
+          console.log('[KeyVault] Manual lock not supported (auto-lock active)')
           return res.json({ success:true, note:'Auto-lock active' })
         }
       }
