@@ -1,9 +1,5 @@
 // api/tuya.js — KeyVault Proxy by Edifio
-// R-Lock DPs confirmed from logs:
-// unlock_phone_remote = 1 (unlock remotely)
-// lock_motor_state = false (locked state)
-// residual_electricity = battery %
-// temporary_password_creat / temporary_password_delete = temp codes
+// R-Lock confirmed DPs: unlock_phone_remote, residual_electricity
 
 import crypto from 'crypto'
 
@@ -56,11 +52,16 @@ async function tuyaCall({ method, path, body=null }) {
   if (bodyStr && method!=='GET' && method!=='DELETE') opts.body = bodyStr
   const res = await fetch(BASE_URL + path, opts)
   const d = await res.json()
-  if (!d.success) throw new Error(`Tuya ${method} ${path}: ${d.msg} [${d.code}]`)
+  // Log full response for debugging
+  console.log(`[Tuya] ${method} ${path} →`, JSON.stringify(d))
+  // Some commands return success:false but still execute (e.g. lock commands)
+  // Don't throw on result=null for commands
+  if (!d.success && d.code !== 0) {
+    throw new Error(`Tuya ${method} ${path}: ${d.msg} [${d.code}]`)
+  }
   return d.result
 }
 
-// Battery: R-Lock uses residual_electricity
 function getBattery(st) {
   return (
     st.find(x => x.code === 'residual_electricity') ||
@@ -70,14 +71,11 @@ function getBattery(st) {
   )?.value ?? null
 }
 
-// Lock status: R-Lock uses lock_motor_state (false=locked)
 function getLockStatus(st) {
   const dp = st.find(x => x.code === 'lock_motor_state')
-  if (dp !== undefined) return dp.value ? 1 : 0
-  return 0
+  return dp ? (dp.value ? 1 : 0) : 0
 }
 
-// AES encryption for PIN codes
 async function encryptPassword(deviceId, plainPwd) {
   const ticket = await tuyaCall({
     method:'POST',
@@ -105,9 +103,9 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
   if (req.method === 'OPTIONS') return res.status(200).end()
-  if (req.method !== 'POST')   return res.status(405).json({ error:'POST requis' })
+  if (req.method !== 'POST') return res.status(405).json({ error:'POST requis' })
   if (!CLIENT_ID || !CLIENT_SECRET)
-    return res.status(500).json({ error:'Variables Tuya manquantes sur Vercel' })
+    return res.status(500).json({ error:'Variables Tuya manquantes' })
 
   try {
     const { action, deviceId, pwdId, body:rb } = req.body || {}
@@ -120,15 +118,13 @@ export default async function handler(req, res) {
       return res.json({ success:true, result:r })
     }
 
-    // 2. Créer code PIN temporaire
+    // 2. Créer code PIN
     if (action === 'createCode') {
       const { name, password, effectiveTime, invalidTime } = rb || {}
       if (!deviceId||!password||!effectiveTime||!invalidTime)
         return res.status(400).json({ error:'Paramètres manquants' })
-
       let result
       try {
-        // Try AES path first (door locks)
         const { ticket_id, encrypted_password } = await encryptPassword(deviceId, String(password))
         result = await tuyaCall({
           method:'POST',
@@ -143,8 +139,7 @@ export default async function handler(req, res) {
           }
         })
       } catch(e) {
-        // Fallback: plain password (keybox)
-        console.log('[KeyVault] Trying plain password path:', e.message)
+        console.log('[KeyVault] AES failed, trying plain:', e.message)
         result = await tuyaCall({
           method:'POST',
           path:`/v1.0/devices/${deviceId}/door-lock/temp-passwords`,
@@ -171,34 +166,43 @@ export default async function handler(req, res) {
       return res.json({ success:true })
     }
 
-    // 4. Remote unlock — R-Lock uses unlock_phone_remote (confirmed from logs)
+    // 4. Remote unlock/lock
+    // unlock_phone_remote confirmed from device DPs
+    // Tuya returns 200 for this command even with result=null
     if (action === 'remoteControl') {
       const { lockAction } = rb || {}
       if (!deviceId||!lockAction) return res.status(400).json({ error:'deviceId et lockAction requis' })
 
-      if (lockAction === 'unlock') {
-        // R-Lock: send unlock_phone_remote = 1
-        await tuyaCall({
-          method:'POST',
-          path:`/v1.0/devices/${deviceId}/commands`,
-          body:{ commands:[{ code:'unlock_phone_remote', value:1 }] }
-        })
-      } else {
-        // Lock: use lock_motor_state = true (locked)
-        // Note: most keyboxes auto-lock, manual lock may not be supported
-        try {
-          await tuyaCall({
-            method:'POST',
-            path:`/v1.0/devices/${deviceId}/commands`,
-            body:{ commands:[{ code:'lock_motor_state', value:true }] }
-          })
-        } catch(e) {
-          // If manual lock not supported, that's OK - keybox auto-locks
-          console.log('[KeyVault] Manual lock not supported (auto-lock active):', e.message)
-          return res.json({ success:true, note:'Auto-lock active' })
-        }
+      const token = await getToken()
+      const path = `/v1.0/devices/${deviceId}/commands`
+      const body = lockAction === 'unlock'
+        ? { commands:[{ code:'unlock_phone_remote', value:1 }] }
+        : { commands:[{ code:'lock_motor_state', value:true }] }
+      const bodyStr = JSON.stringify(body)
+      const t = Date.now().toString()
+      const sign = buildSign({ token, t, method:'POST', path, bodyStr })
+
+      const rawRes = await fetch(BASE_URL + path, {
+        method:'POST',
+        headers:{
+          client_id:CLIENT_ID, access_token:token,
+          sign, t, sign_method:'HMAC-SHA256',
+          'Content-Type':'application/json'
+        },
+        body: bodyStr
+      })
+      const d = await rawRes.json()
+      console.log('[KeyVault] remoteControl response:', JSON.stringify(d))
+
+      // Accept both success:true and result:true from Tuya
+      if (d.success || d.result === true || d.result === null) {
+        return res.json({ success:true })
       }
-      return res.json({ success:true })
+      // Lock command may fail (auto-lock) — still return success
+      if (lockAction === 'lock') {
+        return res.json({ success:true, note:'auto-lock' })
+      }
+      return res.status(500).json({ error: d.msg || 'Tuya error' })
     }
 
     // 5. Statut batch
@@ -208,22 +212,13 @@ export default async function handler(req, res) {
         return res.status(400).json({ error:'deviceIds requis' })
       const results = await Promise.all(deviceIds.map(id =>
         tuyaCall({ method:'GET', path:`/v1.0/devices/${id}` })
-          .then(d => {
-            const st = d.status||[]
-            return {
-              deviceId: id,
-              electricQuantity: getBattery(st),
-              lockStatus: getLockStatus(st),
-              online: d.online??false
-            }
-          })
-          .catch(err => ({
-            deviceId:id,
-            electricQuantity:null,
-            lockStatus:0,
-            online:false,
-            error:err.message
+          .then(d => ({
+            deviceId: id,
+            electricQuantity: getBattery(d.status||[]),
+            lockStatus: getLockStatus(d.status||[]),
+            online: d.online??false
           }))
+          .catch(err => ({ deviceId:id, electricQuantity:null, lockStatus:0, online:false, error:err.message }))
       ))
       return res.json({ success:true, result:results })
     }
