@@ -120,6 +120,17 @@ export default async function handler(req, res) {
       return res.json({ success:true, result:r })
     }
 
+    // 1b. Diagnostic — retourne status + functions du device
+    if (action === 'debugDevice') {
+      if (!deviceId) return res.status(400).json({ error:'deviceId requis' })
+      const [device, functions, status] = await Promise.all([
+        tuyaCall({ method:'GET', path:`/v1.0/devices/${deviceId}` }),
+        tuyaCall({ method:'GET', path:`/v1.0/devices/${deviceId}/functions` }).catch(e=>({_err:e.message})),
+        tuyaCall({ method:'GET', path:`/v1.0/devices/${deviceId}/status` }).catch(e=>({_err:e.message})),
+      ])
+      return res.json({ success:true, result:{ device, functions, status } })
+    }
+
     // 2. Créer code PIN temporaire
     if (action === 'createCode') {
       const { name, password, effectiveTime, invalidTime } = rb || {}
