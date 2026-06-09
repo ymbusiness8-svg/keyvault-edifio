@@ -1,5 +1,5 @@
 // api/tuya.js — KeyVault Proxy by Edifio
-// Version finale — signature + chiffrement AES du code PIN (requis par Tuya)
+// Version production — signature Tuya v1.0 + multi-DP support (R-Lock keybox)
 
 import crypto from 'crypto'
 
@@ -7,27 +7,19 @@ const CLIENT_ID     = process.env.TUYA_CLIENT_ID
 const CLIENT_SECRET = process.env.TUYA_CLIENT_SECRET
 const BASE_URL      = 'https://openapi.tuyaeu.com'
 
-// ── Cache token ──
 let _token = null, _tokenExp = 0
 
-// ── Helpers crypto ──
 const hmacSha256 = (msg, secret) =>
   crypto.createHmac('sha256', secret).update(msg,'utf8').digest('hex').toUpperCase()
-
 const sha256Hex = (str) =>
   crypto.createHash('sha256').update(str||'','utf8').digest('hex')
 
-// ── Signature Tuya v1.0 (nouvelle version post-juin 2021) ──
-// Token endpoint : str = clientId + t + stringToSign
-// Autres endpoints : str = clientId + accessToken + t + stringToSign
-// stringToSign = method\nSHA256(body)\n\npathWithQuery
 function buildSign({ token='', t, method, path, bodyStr='' }) {
   const bodyHash = sha256Hex(bodyStr)
   const sts = [method.toUpperCase(), bodyHash, '', path].join('\n')
   return hmacSha256(CLIENT_ID + token + t + sts, CLIENT_SECRET)
 }
 
-// ── Token avec cache ──
 async function getToken() {
   const now = Date.now()
   if (_token && now < _tokenExp) return _token
@@ -44,8 +36,7 @@ async function getToken() {
   return _token
 }
 
-// ── Appel API Tuya signé ──
-async function call({ method, path, body=null }) {
+async function tuyaCall({ method, path, body=null }) {
   const token = await getToken()
   const t = Date.now().toString()
   const bodyStr = body ? JSON.stringify(body) : ''
@@ -65,120 +56,162 @@ async function call({ method, path, body=null }) {
   return d.result
 }
 
-// ── AES password encryption (requis par Tuya WiFi lock) ──
-// 1. Obtenir ticket → ticket_key (AES-256-ECB chiffré avec clientSecret)
-// 2. Déchiffrer ticket_key pour obtenir la clé AES → aes_key
-// 3. Chiffrer le PIN avec AES-128-ECB-PKCS7 using aes_key → hex
-async function encryptPassword(deviceId, plainPwd) {
-  // Step 1: Obtenir le ticket
-  const ticket = await call({
-    method:'POST',
-    path:`/v1.0/devices/${deviceId}/door-lock/password-ticket`
-  })
-  const { ticket_id, ticket_key } = ticket
+// Detect battery DP from status array (R-Lock uses different names than door locks)
+function getBattery(st) {
+  return (
+    st.find(x => x.code === 'battery_percentage') ||
+    st.find(x => x.code === 'residual_electricity') ||
+    st.find(x => x.code === 'battery') ||
+    st.find(x => x.code === 'battery_state') ||
+    st.find(x => x.code === 'va_battery')
+  )?.value ?? null
+}
 
-  // Step 2: Déchiffrer ticket_key avec AES-256-ECB(clientSecret)
-  // ticket_key est en hex, clientSecret utilisé directement comme clé (32 bytes)
-  const secretBuf = Buffer.from(CLIENT_SECRET.slice(0,32), 'utf8') // 32 bytes pour AES-256
+// Detect lock status DP
+function getLockStatus(st) {
+  const dp =
+    st.find(x => x.code === 'lock_motor_state') ||
+    st.find(x => x.code === 'switch_1') ||
+    st.find(x => x.code === 'open_close') ||
+    st.find(x => x.code === 'unlock') ||
+    st.find(x => x.code === 'closed_opened')
+  return dp ? (dp.value ? 1 : 0) : 0
+}
+
+// Detect right DP code and value for lock/unlock command
+function getLockCommand(st, lockAction) {
+  if (st.find(x => x.code === 'switch_1'))
+    return { code: 'switch_1', value: lockAction !== 'lock' }
+  if (st.find(x => x.code === 'open_close'))
+    return { code: 'open_close', value: lockAction !== 'lock' }
+  if (st.find(x => x.code === 'unlock'))
+    return { code: 'unlock', value: true }
+  // Default: lock_motor_state (true = unlocked, false = locked)
+  return { code: 'lock_motor_state', value: lockAction !== 'lock' }
+}
+
+// AES encryption for PIN codes
+async function encryptPassword(deviceId, plainPwd) {
+  const ticket = await tuyaCall({ method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/password-ticket` })
+  const { ticket_id, ticket_key } = ticket
+  const secretBuf = Buffer.from(CLIENT_SECRET.slice(0,32), 'utf8')
   const ticketBuf = Buffer.from(ticket_key, 'hex')
   const decipher = crypto.createDecipheriv('aes-256-ecb', secretBuf, null)
   decipher.setAutoPadding(false)
   const aesKey = Buffer.concat([decipher.update(ticketBuf), decipher.final()])
-
-  // Step 3: Chiffrer le PIN avec AES-128-ECB-PKCS7
-  // AES-128 = 16 bytes key
   const aes128Key = aesKey.slice(0,16)
   const cipher = crypto.createCipheriv('aes-128-ecb', aes128Key, null)
-  // PKCS7 padding est automatique avec createCipheriv
-  const pwdBuf = Buffer.from(plainPwd, 'utf8')
-  const encryptedPwd = Buffer.concat([cipher.update(pwdBuf), cipher.final()]).toString('hex')
-
+  const encryptedPwd = Buffer.concat([cipher.update(Buffer.from(plainPwd,'utf8')), cipher.final()]).toString('hex')
   return { ticket_id, encrypted_password: encryptedPwd }
 }
 
-// ── Vercel config ──
 export const config = { api: { bodyParser: { sizeLimit: '1mb' } } }
 
-// ── Handler principal ──
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
   if (req.method === 'OPTIONS') return res.status(200).end()
   if (req.method !== 'POST')   return res.status(405).json({ error:'POST requis' })
-
   if (!CLIENT_ID || !CLIENT_SECRET)
-    return res.status(500).json({ error:'TUYA_CLIENT_ID ou TUYA_CLIENT_SECRET manquant' })
+    return res.status(500).json({ error:'Variables Tuya manquantes sur Vercel' })
 
   try {
     const { action, deviceId, pwdId, body:rb } = req.body || {}
     if (!action) return res.status(400).json({ error:'action requise' })
 
-    // ── 1. Statut serrure ──
+    // 1. Statut appareil + tous les DPs (debug inclus)
     if (action === 'getDevice') {
       if (!deviceId) return res.status(400).json({ error:'deviceId requis' })
-      const r = await call({ method:'GET', path:`/v1.0/devices/${deviceId}` })
+      const r = await tuyaCall({ method:'GET', path:`/v1.0/devices/${deviceId}` })
+      console.log('[KeyVault] Device DPs:', JSON.stringify(r?.status||[]))
       return res.json({ success:true, result:r })
     }
 
-    // ── 2. Créer code PIN temporaire ──
-    // IMPORTANT: Tuya WiFi lock requiert le mot de passe AES-chiffré via ticket
+    // 2. Créer code PIN (avec AES encryption pour WiFi locks)
     if (action === 'createCode') {
       const { name, password, effectiveTime, invalidTime } = rb || {}
       if (!deviceId||!password||!effectiveTime||!invalidTime)
-        return res.status(400).json({ error:'deviceId, password, effectiveTime, invalidTime requis' })
+        return res.status(400).json({ error:'Paramètres manquants' })
 
-      // Chiffrer le PIN
-      const { ticket_id, encrypted_password } = await encryptPassword(deviceId, String(password))
-
-      // Créer le mot de passe sur Tuya
-      const r = await call({
-        method:'POST',
-        path:`/v1.0/devices/${deviceId}/door-lock/temp-password`,
-        body:{
-          Name: name || 'Locataire',   // capital N selon docs Tuya
-          password: encrypted_password,
-          effective_time: Math.floor(effectiveTime / 1000),
-          invalid_time:   Math.floor(invalidTime   / 1000),
-          password_type: 'ticket',
-          ticket_id
-        }
-      })
-      // Retourner l'ID Tuya + le PIN en clair (pour l'afficher au locataire)
-      return res.json({ success:true, result:{ id:r?.id, password:String(password) } })
+      let result
+      try {
+        // Try AES-encrypted path first (WiFi door locks)
+        const { ticket_id, encrypted_password } = await encryptPassword(deviceId, String(password))
+        result = await tuyaCall({
+          method:'POST',
+          path:`/v1.0/devices/${deviceId}/door-lock/temp-password`,
+          body:{
+            Name: name||'Locataire',
+            password: encrypted_password,
+            effective_time: Math.floor(effectiveTime/1000),
+            invalid_time: Math.floor(invalidTime/1000),
+            password_type:'ticket',
+            ticket_id
+          }
+        })
+      } catch(e) {
+        // Fallback: plain password (keybox / older devices)
+        console.log('[KeyVault] AES path failed, trying plain:', e.message)
+        result = await tuyaCall({
+          method:'POST',
+          path:`/v1.0/devices/${deviceId}/door-lock/temp-passwords`,
+          body:{
+            name: name||'Locataire',
+            password: String(password),
+            effective_time: Math.floor(effectiveTime/1000),
+            invalid_time: Math.floor(invalidTime/1000),
+            type: 0
+          }
+        })
+      }
+      return res.json({ success:true, result:{ id:result?.id, password:String(password) } })
     }
 
-    // ── 3. Révoquer code ──
+    // 3. Révoquer code
     if (action === 'revokeCode') {
       if (!deviceId||!pwdId) return res.status(400).json({ error:'deviceId et pwdId requis' })
-      await call({ method:'DELETE', path:`/v1.0/devices/${deviceId}/door-lock/temp-passwords/${pwdId}` })
+      try {
+        await tuyaCall({ method:'DELETE', path:`/v1.0/devices/${deviceId}/door-lock/temp-passwords/${pwdId}` })
+      } catch(e) {
+        await tuyaCall({ method:'DELETE', path:`/v1.0/devices/${deviceId}/door-lock/temp-password/${pwdId}` })
+      }
       return res.json({ success:true })
     }
 
-    // ── 4. Lock / Unlock distant ──
+    // 4. Lock / Unlock — détecte automatiquement le bon DP
     if (action === 'remoteControl') {
       const { lockAction } = rb || {}
       if (!deviceId||!lockAction) return res.status(400).json({ error:'deviceId et lockAction requis' })
-      await call({
+      // Get device status to detect DP
+      const dev = await tuyaCall({ method:'GET', path:`/v1.0/devices/${deviceId}` })
+      const st = dev.status || []
+      const cmd = getLockCommand(st, lockAction)
+      console.log('[KeyVault] Lock command:', cmd)
+      await tuyaCall({
         method:'POST',
         path:`/v1.0/devices/${deviceId}/commands`,
-        body:{ commands:[{ code:'lock_motor_state', value: lockAction==='lock' }] }
+        body:{ commands:[cmd] }
       })
       return res.json({ success:true })
     }
 
-    // ── 5. Statut batch serrures ──
+    // 5. Statut batch plusieurs appareils
     if (action === 'getLocks') {
       const { deviceIds } = rb || {}
       if (!Array.isArray(deviceIds)||deviceIds.length===0)
-        return res.status(400).json({ error:'deviceIds array requis' })
+        return res.status(400).json({ error:'deviceIds requis' })
       const results = await Promise.all(deviceIds.map(id =>
-        call({ method:'GET', path:`/v1.0/devices/${id}` })
+        tuyaCall({ method:'GET', path:`/v1.0/devices/${id}` })
           .then(d => {
-            const st  = d.status||[]
-            const bat = st.find(x=>x.code==='battery_percentage')?.value ?? null
-            const lk  = st.find(x=>x.code==='lock_motor_state')?.value
-            return { deviceId:id, electricQuantity:bat, lockStatus:lk?1:0, online:d.online??false }
+            const st = d.status||[]
+            console.log(`[KeyVault] DPs for ${id}:`, JSON.stringify(st))
+            return {
+              deviceId: id,
+              electricQuantity: getBattery(st),
+              lockStatus: getLockStatus(st),
+              online: d.online??false
+            }
           })
           .catch(err => ({ deviceId:id, electricQuantity:null, lockStatus:0, online:false, error:err.message }))
       ))
