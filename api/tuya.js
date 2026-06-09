@@ -188,35 +188,37 @@ export default async function handler(req, res) {
       if (!deviceId||!lockAction) return res.status(400).json({ error:'deviceId et lockAction requis' })
 
       if (lockAction === 'unlock') {
-        // Strategy 1: dedicated door-lock remote-unlock-login endpoint
+        const errors = []
+
+        // Strategy 1: v2.0 shadow properties — unlock_phone_remote
         try {
-          await tuyaCall({
-            method:'POST',
-            path:`/v1.0/devices/${deviceId}/door-lock/remote-unlock-login`,
-            body:{}
-          })
-          console.log('[KeyVault] Unlocked via remote-unlock-login')
-        } catch(e1) {
-          console.log('[KeyVault] remote-unlock-login failed:', e1.message)
-          // Strategy 2: door-lock/remote-unlock
-          try {
-            await tuyaCall({
-              method:'POST',
-              path:`/v1.0/devices/${deviceId}/door-lock/remote-unlock`,
-              body:{ open:true }
-            })
-            console.log('[KeyVault] Unlocked via door-lock/remote-unlock')
-          } catch(e2) {
-            console.log('[KeyVault] remote-unlock failed:', e2.message)
-            // Strategy 3: remote_no_dp_key with 4-byte payload [0,0,0,1]
-            await tuyaCall({
-              method:'POST',
-              path:`/v1.0/devices/${deviceId}/commands`,
-              body:{ commands:[{ code:'remote_no_dp_key', value:'AAAAAQ==' }] }
-            })
-            console.log('[KeyVault] Unlocked via remote_no_dp_key AAAAAQ==')
-          }
-        }
+          await tuyaCall({ method:'POST', path:`/v2.0/cloud/thing/${deviceId}/shadow/properties/issue`, body:{ properties:{ unlock_phone_remote:1 } } })
+          console.log('[KeyVault] S1 OK: v2.0 shadow unlock_phone_remote')
+          return res.json({ success:true })
+        } catch(e){ errors.push('S1:'+e.message); console.log('[KeyVault] S1 fail:', e.message) }
+
+        // Strategy 2: door-lock/remote-no-dp-key endpoint
+        try {
+          await tuyaCall({ method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/remote-no-dp-key`, body:{} })
+          console.log('[KeyVault] S2 OK: remote-no-dp-key endpoint')
+          return res.json({ success:true })
+        } catch(e){ errors.push('S2:'+e.message); console.log('[KeyVault] S2 fail:', e.message) }
+
+        // Strategy 3: door-lock/remote-unlock-login
+        try {
+          await tuyaCall({ method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/remote-unlock-login`, body:{} })
+          console.log('[KeyVault] S3 OK: remote-unlock-login')
+          return res.json({ success:true })
+        } catch(e){ errors.push('S3:'+e.message); console.log('[KeyVault] S3 fail:', e.message) }
+
+        // Strategy 4: manual_lock = false (writable Boolean DP)
+        try {
+          await tuyaCall({ method:'POST', path:`/v1.0/devices/${deviceId}/commands`, body:{ commands:[{ code:'manual_lock', value:false }] } })
+          console.log('[KeyVault] S4 OK: manual_lock false')
+          return res.json({ success:true })
+        } catch(e){ errors.push('S4:'+e.message); console.log('[KeyVault] S4 fail:', e.message) }
+
+        throw new Error('Toutes les stratégies ont échoué — ' + errors.join(' | '))
       } else {
         // K5 auto-locks after 4s (automatic_lock=true) — no manual lock command needed
         console.log('[KeyVault] K5 auto-locks — skipping manual lock command')
