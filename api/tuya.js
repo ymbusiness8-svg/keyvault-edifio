@@ -183,7 +183,26 @@ export default async function handler(req, res) {
               console.log('[KeyVault] Code S4 temp-passwords OK')
             } catch(e4) {
               console.log('[KeyVault] S4 fail:', e4.message)
-              throw new Error(`Création code impossible — S1:${e1.message} | S2:${e2.message} | S3:${e3.message} | S4:${e4.message}`)
+
+              // S5: Direct DP command — temporary_password_creat (Raw hex)
+              // Format: type(1B) + start_time(4B BE) + end_time(4B BE) + pwd_len(1B) + pwd(ASCII)
+              try {
+                const dpBuf = Buffer.alloc(10 + pwd.length)
+                dpBuf.writeUInt8(0x02, 0)         // 0x02 = timed temporary password
+                dpBuf.writeUInt32BE(effSec, 1)    // start time
+                dpBuf.writeUInt32BE(invSec, 5)    // end time
+                dpBuf.writeUInt8(pwd.length, 9)   // password length
+                Buffer.from(pwd, 'ascii').copy(dpBuf, 10)
+                const dpHex = dpBuf.toString('hex')
+                result = await tuyaCall({
+                  method:'POST', path:`/v1.0/devices/${deviceId}/commands`,
+                  body:{ commands:[{ code:'temporary_password_creat', value:dpHex }] }
+                })
+                console.log('[KeyVault] Code S5 DP-command OK, hex:', dpHex)
+              } catch(e5) {
+                console.log('[KeyVault] S5 fail:', e5.message)
+                throw new Error(`Création code impossible — S1:${e1.message} | S2:${e2.message} | S3:${e3.message} | S4:${e4.message} | S5:${e5.message}`)
+              }
             }
           }
         }
