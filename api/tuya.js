@@ -137,38 +137,58 @@ export default async function handler(req, res) {
       if (!deviceId||!password||!effectiveTime||!invalidTime)
         return res.status(400).json({ error:'Paramètres manquants' })
 
+      const pwd    = String(password)
+      const pname  = name||'Locataire'
+      const effSec = Math.floor(effectiveTime/1000)
+      const invSec = Math.floor(invalidTime/1000)
       let result
+
+      // S1: AES encrypted (standard door locks)
       try {
-        // Try AES path first (door locks)
-        const { ticket_id, encrypted_password } = await encryptPassword(deviceId, String(password))
+        const { ticket_id, encrypted_password } = await encryptPassword(deviceId, pwd)
         result = await tuyaCall({
-          method:'POST',
-          path:`/v1.0/devices/${deviceId}/door-lock/temp-password`,
-          body:{
-            Name: name||'Locataire',
-            password: encrypted_password,
-            effective_time: Math.floor(effectiveTime/1000),
-            invalid_time: Math.floor(invalidTime/1000),
-            password_type:'ticket',
-            ticket_id
-          }
+          method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/temp-password`,
+          body:{ Name:pname, password:encrypted_password, effective_time:effSec, invalid_time:invSec, password_type:'ticket', ticket_id }
         })
-      } catch(e) {
-        // Fallback: plain password (keybox)
-        console.log('[KeyVault] Trying plain password path:', e.message)
-        result = await tuyaCall({
-          method:'POST',
-          path:`/v1.0/devices/${deviceId}/door-lock/temp-passwords`,
-          body:{
-            name: name||'Locataire',
-            password: String(password),
-            effective_time: Math.floor(effectiveTime/1000),
-            invalid_time: Math.floor(invalidTime/1000),
-            type: 0
+        console.log('[KeyVault] Code S1 AES OK')
+      } catch(e1) {
+        console.log('[KeyVault] S1 AES fail:', e1.message)
+
+        // S2: plain temp-password singular (some jtmspro models)
+        try {
+          result = await tuyaCall({
+            method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/temp-password`,
+            body:{ name:pname, password:pwd, effective_time:effSec, invalid_time:invSec, password_type:'0' }
+          })
+          console.log('[KeyVault] Code S2 plain-singular OK')
+        } catch(e2) {
+          console.log('[KeyVault] S2 fail:', e2.message)
+
+          // S3: temp-passcode (jtmspro key boxes)
+          try {
+            result = await tuyaCall({
+              method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/temp-passcode`,
+              body:{ name:pname, password:pwd, effective_time:effSec, invalid_time:invSec }
+            })
+            console.log('[KeyVault] Code S3 temp-passcode OK')
+          } catch(e3) {
+            console.log('[KeyVault] S3 fail:', e3.message)
+
+            // S4: temp-passwords plural with type
+            try {
+              result = await tuyaCall({
+                method:'POST', path:`/v1.0/devices/${deviceId}/door-lock/temp-passwords`,
+                body:{ name:pname, password:pwd, effective_time:effSec, invalid_time:invSec, type:0 }
+              })
+              console.log('[KeyVault] Code S4 temp-passwords OK')
+            } catch(e4) {
+              console.log('[KeyVault] S4 fail:', e4.message)
+              throw new Error(`Création code impossible — S1:${e1.message} | S2:${e2.message} | S3:${e3.message} | S4:${e4.message}`)
+            }
           }
-        })
+        }
       }
-      return res.json({ success:true, result:{ id:result?.id, password:String(password) } })
+      return res.json({ success:true, result:{ id:result?.id, password:pwd } })
     }
 
     // 3. Révoquer code
