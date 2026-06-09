@@ -188,13 +188,35 @@ export default async function handler(req, res) {
       if (!deviceId||!lockAction) return res.status(400).json({ error:'deviceId et lockAction requis' })
 
       if (lockAction === 'unlock') {
-        // K5 Smart Key Box: remote_no_dp_key triggers remote open
-        // Value "AAAB" = base64([0x00, 0x00, 0x01]) — standard remote open payload
-        await tuyaCall({
-          method:'POST',
-          path:`/v1.0/devices/${deviceId}/commands`,
-          body:{ commands:[{ code:'remote_no_dp_key', value:'AAAB' }] }
-        })
+        // Strategy 1: dedicated door-lock remote-unlock-login endpoint
+        try {
+          await tuyaCall({
+            method:'POST',
+            path:`/v1.0/devices/${deviceId}/door-lock/remote-unlock-login`,
+            body:{}
+          })
+          console.log('[KeyVault] Unlocked via remote-unlock-login')
+        } catch(e1) {
+          console.log('[KeyVault] remote-unlock-login failed:', e1.message)
+          // Strategy 2: door-lock/remote-unlock
+          try {
+            await tuyaCall({
+              method:'POST',
+              path:`/v1.0/devices/${deviceId}/door-lock/remote-unlock`,
+              body:{ open:true }
+            })
+            console.log('[KeyVault] Unlocked via door-lock/remote-unlock')
+          } catch(e2) {
+            console.log('[KeyVault] remote-unlock failed:', e2.message)
+            // Strategy 3: remote_no_dp_key with 4-byte payload [0,0,0,1]
+            await tuyaCall({
+              method:'POST',
+              path:`/v1.0/devices/${deviceId}/commands`,
+              body:{ commands:[{ code:'remote_no_dp_key', value:'AAAAAQ==' }] }
+            })
+            console.log('[KeyVault] Unlocked via remote_no_dp_key AAAAAQ==')
+          }
+        }
       } else {
         // K5 auto-locks after 4s (automatic_lock=true) — no manual lock command needed
         console.log('[KeyVault] K5 auto-locks — skipping manual lock command')
