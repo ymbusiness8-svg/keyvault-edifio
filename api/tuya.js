@@ -188,62 +188,17 @@ export default async function handler(req, res) {
       if (!deviceId||!lockAction) return res.status(400).json({ error:'deviceId et lockAction requis' })
 
       if (lockAction === 'unlock') {
-        // Try multiple DP codes — varies by model
-        const unlockDPs = [
-          { code:'unlock_phone_remote', value:true },
-          { code:'remote_lock_motor',   value:false },
-          { code:'lock_motor_state',    value:false },
-          { code:'open_close',          value:true  },
-        ]
-        let unlocked = false
-        let lastErr = null
-        for (const dp of unlockDPs) {
-          try {
-            await tuyaCall({
-              method:'POST',
-              path:`/v1.0/devices/${deviceId}/commands`,
-              body:{ commands:[dp] }
-            })
-            console.log('[KeyVault] Unlock succeeded with DP:', dp.code)
-            unlocked = true
-            break
-          } catch(e) {
-            if (e.message.includes('2008') || e.message.includes('2012') || e.message.includes('not support')) {
-              lastErr = e
-              continue
-            }
-            throw e
-          }
-        }
-        if (!unlocked) throw lastErr
+        // K5 Smart Key Box: remote_no_dp_key triggers remote open
+        // Value "AAAB" = base64([0x00, 0x00, 0x01]) — standard remote open payload
+        await tuyaCall({
+          method:'POST',
+          path:`/v1.0/devices/${deviceId}/commands`,
+          body:{ commands:[{ code:'remote_no_dp_key', value:'AAAB' }] }
+        })
       } else {
-        // Lock: try multiple DPs
-        const lockDPs = [
-          { code:'lock_motor_state',  value:true  },
-          { code:'remote_lock_motor', value:true  },
-          { code:'open_close',        value:false },
-        ]
-        let locked = false
-        for (const dp of lockDPs) {
-          try {
-            await tuyaCall({
-              method:'POST',
-              path:`/v1.0/devices/${deviceId}/commands`,
-              body:{ commands:[dp] }
-            })
-            console.log('[KeyVault] Lock succeeded with DP:', dp.code)
-            locked = true
-            break
-          } catch(e) {
-            if (e.message.includes('2008') || e.message.includes('2012') || e.message.includes('not support')) continue
-            throw e
-          }
-        }
-        if (!locked) {
-          // Keybox auto-locks — not an error
-          console.log('[KeyVault] Manual lock not supported (auto-lock active)')
-          return res.json({ success:true, note:'Auto-lock active' })
-        }
+        // K5 auto-locks after 4s (automatic_lock=true) — no manual lock command needed
+        console.log('[KeyVault] K5 auto-locks — skipping manual lock command')
+        return res.json({ success:true, note:'Auto-lock active' })
       }
       return res.json({ success:true })
     }
